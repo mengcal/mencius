@@ -204,7 +204,7 @@ class Pipe:
         resp.raise_for_status()
         return self._strip_thinking(resp.json()["choices"][0]["message"]["content"])
 
-    def _parallel_call(self, participants, prompt, system_prompt):
+    def _parallel_call(self, participants, prompt, system_prompt, max_tokens=None):
         """并发调用多个模型，按完成顺序返回结果。"""
         results = []
         with concurrent.futures.ThreadPoolExecutor(
@@ -212,7 +212,7 @@ class Pipe:
         ) as executor:
             futures = {}
             for p in participants:
-                future = executor.submit(self._call_model, p, prompt, system_prompt)
+                future = executor.submit(self._call_model, p, prompt, system_prompt, max_tokens)
                 futures[future] = p
             for future in concurrent.futures.as_completed(futures):
                 p = futures[future]
@@ -513,9 +513,20 @@ class Pipe:
 
         R1_SYS = "你是一场圆桌会议的参与者。请直接发表观点，用中文回答，控制在300字以内。"
 
+        # === 动态计算 max_tokens ===
+        n = len(participants)
+        # 第一轮：每个模型只需表达自己，基础额度即可
+        r1_max_tokens = self.valves.MAX_TOKENS
+        # 第二轮：要点评所有其他人的观点，人数越多需要越多额度
+        # 基础 1500 + 每个其他人 500 token
+        r2_max_tokens = min(1500 + (n - 1) * 500, 6000)
+        # 主持人：要读全部两轮讨论再总结，需要最多
+        # 基础 3000 + 每个参与者 800 token
+        mod_max_tokens = min(3000 + n * 800, 8000)
+
         # === 第一轮 ===
         yield f"## 第一轮：各自观点\n\n"
-        r1_results = self._parallel_call(participants, R1_PROMPT, R1_SYS)
+        r1_results = self._parallel_call(participants, R1_PROMPT, R1_SYS, max_tokens=r1_max_tokens)
         for label, model, text in r1_results:
             yield f"### {label}（{model}）\n\n{text}\n\n"
 
@@ -533,11 +544,11 @@ class Pipe:
             "1. 你同意谁的观点？为什么？\n"
             "2. 你反对谁的观点？为什么？\n"
             "3. 你要补充或修改自己的观点吗？\n"
-            "用中文，控制在400字以内。"
+            f"用中文，控制在{300 + (n-1)*100}字以内。"
         )
         R2_SYS = "你是圆桌会议参与者，现在进入第二轮。请认真点评他人观点并表态，用中文。"
 
-        r2_results = self._parallel_call(participants, R2_PROMPT, R2_SYS)
+        r2_results = self._parallel_call(participants, R2_PROMPT, R2_SYS, max_tokens=r2_max_tokens)
         for label, model, text in r2_results:
             yield f"### {label}（{model}）\n\n{text}\n\n"
 
@@ -572,7 +583,7 @@ class Pipe:
         try:
             mod_text = self._call_model(
                 moderator, MOD_PROMPT, MOD_SYS,
-                max_tokens=self.valves.MODERATOR_MAX_TOKENS,
+                max_tokens=mod_max_tokens,
             )
             yield mod_text
         except Exception as e:
